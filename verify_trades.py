@@ -7,12 +7,16 @@ trade tick by tick, then reports PASS/FAIL per trade.
 
     python verify_trades.py results/backtest_straddle_45dte_t50_s100_exit21_....csv
 
-The rule parameters (dte, target %, stop %, exit dte, lot size) are parsed from
-the file name; override with --dte/--target-pct/--stop-pct/--exit-dte/--lot-size.
+The rule parameters (dte, n, target %, stop %, exit dte, lot size) are parsed
+from the file name; override with --dte/--n/--target-pct/--stop-pct/--exit-dte/
+--lot-size. Works for both strategies: n is 0 for the straddle, and the
+strangle's call/put strikes are re-derived as the listed strikes nearest to
+ATM+n / ATM-n.
 
 Per trade it checks:
   1. entry tick  = first tick on/after (expiry - dte days)
-  2. strike      = the listed strike nearest to spot at that tick
+  2. strikes     = ATM is the listed strike nearest to spot at that tick; call
+                   is nearest to ATM+n, put nearest to ATM-n
   3. entry call/put/credit match the raw prices
   4. exit tick   = the FIRST tick where combined <= target level or >= stop
                    level; if none, the first tick on/after (expiry - exit_dte)
@@ -39,16 +43,18 @@ TOL = 0.011  # rupee tolerance for price / P&L comparisons (CSV is rounded to 2d
 
 
 def _params_from_name(name):
-    m = re.search(r"(\d+)dte_t([\d.]+)_s([\d.]+)_exit(\d+)", name)
+    m = re.search(r"(\d+)dte(?:_n(\d+))?_t([\d.]+)_s([\d.]+)_exit(\d+)", name)
     if not m:
         return {}
-    return dict(dte=int(m[1]), target_pct=float(m[2]), stop_pct=float(m[3]), exit_dte=int(m[4]))
+    return dict(dte=int(m[1]), n=int(m[2] or 0), target_pct=float(m[3]), stop_pct=float(m[4]),
+                exit_dte=int(m[5]))
 
 
 def _args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("csv")
     p.add_argument("--dte", type=int)
+    p.add_argument("--n", type=int)
     p.add_argument("--target-pct", type=float)
     p.add_argument("--stop-pct", type=float)
     p.add_argument("--exit-dte", type=int)
@@ -60,6 +66,8 @@ def _args():
             setattr(a, k, d.get(k))
         if getattr(a, k) is None:
             sys.exit(f"Could not read --{k.replace('_', '-')} from the file name; pass it explicitly.")
+    if a.n is None:
+        a.n = d.get("n", 0)
     return a
 
 
@@ -71,8 +79,12 @@ def _norm_time(col):
 def main():
     a = _args()
     trades = pd.read_csv(a.csv)
+    if "call_strike" not in trades:  # older straddle files have one `strike` column
+        trades["call_strike"] = trades["put_strike"] = trades["atm_strike"] = trades["strike"]
+    for c in ("call_strike", "put_strike", "atm_strike"):
+        trades[c] = trades[c].astype(int)
     con = duckdb.connect()
-    con.register("trades", trades[["expiry", "strike"]].assign(strike=lambda d: d.strike.astype(int)))
+    con.register("trades", trades[["expiry", "call_strike", "put_strike"]])
 
     exp_n, date_n, time_n = _date_norm_sql("expiry"), _date_norm_sql("pulled_date"), _norm_time("pulled_time")
     base = f"""
@@ -86,7 +98,9 @@ def main():
     con.execute(f"""
         CREATE TABLE path AS
         SELECT r.* FROM ({base}) r
-        JOIN (SELECT CAST(expiry AS DATE) AS expiry, strike FROM trades) x
+        JOIN (SELECT CAST(expiry AS DATE) AS expiry, call_strike AS strike FROM trades
+              UNION
+              SELECT CAST(expiry AS DATE), put_strike FROM trades) x
           ON r.expiry = x.expiry AND r.strike = x.strike
     """)
     # every strike listed at each trade's entry date (to re-derive ATM)
@@ -108,10 +122,13 @@ def main():
     rows, n_fail = [], 0
     for tr in trades.itertuples(index=False):
         exp = pd.to_datetime(tr.expiry).date()
-        p = con.execute("SELECT * FROM path WHERE expiry = ? ORDER BY d, t", [exp]).df()
-        p["d"] = pd.to_datetime(p["d"]).dt.strftime("%Y-%m-%d")
-        p["dt"] = p["d"] + " " + p["t"]
-        p = p.dropna(subset=["ce", "pe"]).drop_duplicates("dt")
+        raw = con.execute("SELECT * FROM path WHERE expiry = ? ORDER BY d, t", [exp]).df()
+        raw["d"] = pd.to_datetime(raw["d"]).dt.strftime("%Y-%m-%d")
+        raw["dt"] = raw["d"] + " " + raw["t"]
+        # call leg from the call strike's rows, put leg from the put strike's rows
+        legs_c = raw[raw["strike"] == tr.call_strike][["dt", "d", "ce"]].drop_duplicates("dt")
+        legs_p = raw[raw["strike"] == tr.put_strike][["dt", "pe"]].drop_duplicates("dt")
+        p = legs_c.merge(legs_p, on="dt").dropna(subset=["ce", "pe"]).sort_values("dt")
         p["combined"] = p["ce"] + p["pe"]
         errs = []
 
@@ -128,12 +145,18 @@ def main():
         if tr.entry_datetime != exp_entry_dt:
             errs.append(f"entry tick {tr.entry_datetime} != expected {exp_entry_dt}")
 
-        # 2. ATM strike from the full chain at that tick
+        # 2. ATM, then call/put strikes, from the full chain at that tick
         snap = ec[ec["t"] == first_t]
         spot0 = float(snap["spot"].iloc[0])
-        atm = int(snap.loc[(snap["strike"] - spot0).abs().idxmin(), "strike"])
-        if int(tr.strike) != atm:
-            errs.append(f"strike {tr.strike} != nearest-to-spot {atm} (spot {spot0})")
+        listed = snap["strike"].astype(int)
+        nearest = lambda target: int(listed.iloc[(listed - target).abs().argmin()])
+        atm = nearest(spot0)
+        exp_call, exp_put = nearest(atm + a.n), nearest(atm - a.n)
+        if tr.atm_strike != atm:
+            errs.append(f"atm strike {tr.atm_strike} != nearest-to-spot {atm} (spot {spot0})")
+        if tr.call_strike != exp_call or tr.put_strike != exp_put:
+            errs.append(f"strikes csv call {tr.call_strike}/put {tr.put_strike} vs expected "
+                        f"call {exp_call}/put {exp_put} (n={a.n})")
 
         # 3. entry prices
         e = p[p["dt"] == tr.entry_datetime]

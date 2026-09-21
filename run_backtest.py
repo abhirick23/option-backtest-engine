@@ -3,7 +3,7 @@ run_backtest.py
 ==================================================
 Command-line runner for the backtest engine.
 
-    python run_backtest.py --dte 45 --target-pct 50 --stop-pct 100 \
+    python run_backtest.py --strategy straddle --dte 45 --target-pct 50 --stop-pct 100 \
         --exit-dte 21 --start 2023-01-01 --end 2023-12-31
 
 Prints the summary and every trade, and writes the trades to results/*.csv.
@@ -19,6 +19,7 @@ import pandas as pd
 from backtest_engine import run_backtest
 from backtest_engine.data import get_available_expiries
 from backtest_engine.storage import coverage_table, save_run
+from backtest_engine.strategies import STRATEGIES
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -29,6 +30,10 @@ def _parse_args():
                     "(profit target) or Y%% of the credit as a loss (stop), else at --exit-dte, "
                     "replayed across monthly expiries."
     )
+    p.add_argument("--strategy", choices=list(STRATEGIES), default="straddle",
+                   help="straddle = sell ATM call+put; strangle = sell call at ATM+n and put at ATM-n")
+    p.add_argument("--n", type=int, default=200,
+                   help="strangle only: strike offset in index points, call=ATM+n / put=ATM-n (default 200)")
     p.add_argument("--dte", type=int, default=45, help="calendar days before expiry to enter (default 45)")
     p.add_argument("--target-pct", type=float, default=50.0,
                    help="profit target: %% of the credit collected, i.e. of max profit (default 50)")
@@ -42,7 +47,7 @@ def _parse_args():
     p.add_argument("--end", type=datetime.date.fromisoformat, default=None,
                    help="last expiry date to include, YYYY-MM-DD (default: latest in the data)")
     p.add_argument("--db", default=str(ROOT / "data" / "market_data.duckdb"), help="path to the DuckDB file")
-    p.add_argument("--out-dir", default=str(ROOT / "results"), help="results root; full runs go to <root>/straddle, shorter runs to <root>/straddle_short_runs")
+    p.add_argument("--out-dir", default=str(ROOT / "results"), help="results root; full runs go to <root>/<strategy>, shorter runs to <root>/<strategy>_short_runs")
     return p.parse_args()
 
 
@@ -60,13 +65,15 @@ def main():
     if start > end:
         sys.exit(f"--start ({start}) is after --end ({end}).")
 
-    print(f"Rule: sell ATM straddle, enter {args.dte} DTE, target {args.target_pct:g}% / "
+    n = args.n if STRATEGIES[args.strategy]["has_n"] else 0
+    what = f"strangle (call ATM+{n} / put ATM-{n})" if n else "ATM straddle"
+    print(f"Rule: sell {what}, enter {args.dte} DTE, target {args.target_pct:g}% / "
           f"stop {args.stop_pct:g}% of credit, time exit {args.exit_dte} DTE, lot size {args.lot_size}")
     print(f"Sweep: monthly expiries from {start} to {end}")
     print("Running (each expiry takes a couple of seconds to load)...\n")
 
     trades_df, summary, skipped_df = run_backtest(
-        db_path, args.dte, args.target_pct, args.stop_pct, args.lot_size, start, end, args.exit_dte
+        db_path, args.dte, args.target_pct, args.stop_pct, args.lot_size, start, end, args.exit_dte, n
     )
 
     if summary["total_trades"] == 0:
@@ -83,8 +90,8 @@ def main():
         print(f"Best trade      : {summary['best_trade']:,.2f}")
         print(f"Worst trade     : {summary['worst_trade']:,.2f}")
 
-        trades_path, full = save_run(trades_df, pathlib.Path(args.out_dir), expiries, args.dte,
-                                     args.target_pct, args.stop_pct, args.exit_dte, start, end)
+        trades_path, full = save_run(args.strategy, trades_df, pathlib.Path(args.out_dir), expiries, args.dte,
+                                     args.target_pct, args.stop_pct, args.exit_dte, start, end, n)
         kind = "FULL run (counts in Compare runs)" if full else "short run (not in Compare runs)"
         print(f"\nTrades written to {trades_path}  -- {kind}")
 

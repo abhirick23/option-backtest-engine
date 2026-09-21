@@ -6,20 +6,27 @@ runs to look at, and compares them side by side.
 """
 
 import pathlib
-import re
 
 import pandas as pd
 import streamlit as st
 
+from app_common import pick_strategy
+from backtest_engine.storage import full_dir, parse_run_name, run_label
+from backtest_engine.strategies import STRATEGIES, label
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-RESULTS = ROOT / "results" / "straddle"  # full runs only
 
 st.set_page_config(page_title="Compare runs", layout="wide")
 st.title("Compare runs")
-st.caption("Full runs (all available data) saved in results/straddle/. Shorter runs live in "
-           "results/straddle_short_runs/ and are not compared here.")
 
-_NAME = re.compile(r"backtest_straddle_(\d+)dte_t([\d.]+)_s([\d.]+)_exit(\d+)_(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})")
+strategy = pick_strategy()
+if strategy is None:
+    st.info("Pick a strategy above to see its saved runs.")
+    st.stop()
+
+RESULTS = ROOT / "results" / full_dir(strategy)  # full runs only
+st.caption(f"Full runs (all available data) of {label(strategy)}, saved in results/{full_dir(strategy)}/. "
+           f"Shorter runs live in results/{full_dir(strategy)}_short_runs/ and are not compared here.")
 
 
 @st.cache_data(show_spinner=False)
@@ -29,13 +36,10 @@ def _load(path_str, mtime):
 
 def _runs():
     runs = {}
-    for f in sorted(RESULTS.glob("backtest_straddle_*.csv")):
-        m = _NAME.search(f.stem)
-        if not m:
-            continue
-        dte, t, s, x, start, end = m.groups()
-        label = f"{dte}→{x} DTE | target {float(t):g}% | stop {float(s):g}% | {start} to {end}"
-        runs[label] = f
+    for f in sorted(RESULTS.glob("backtest_*.csv")):
+        info = parse_run_name(f.stem)
+        if info and info["strategy"] == strategy:
+            runs[run_label(info)] = f
     return runs
 
 
@@ -60,7 +64,7 @@ def _stats(df):
 
 runs = _runs()
 if not runs:
-    st.info("No full runs in results/straddle/ yet. Run a backtest over all the data first.")
+    st.info(f"No full runs of {label(strategy)} yet. Run a backtest over all the data from the home page first.")
     st.stop()
 
 chosen = st.multiselect("Runs", list(runs), default=list(runs)[-3:] if len(runs) > 3 else list(runs))

@@ -13,16 +13,22 @@ import streamlit as st
 
 from backtest_engine import run_backtest
 from backtest_engine.data import get_available_expiries
+from app_common import pick_strategy
 from backtest_engine.storage import coverage_table, save_run
+from backtest_engine.strategies import STRATEGIES, label
 
 ROOT = pathlib.Path(__file__).resolve().parent
 DB_PATH = str(ROOT / "data" / "market_data.duckdb")
 
 st.set_page_config(page_title="Nifty Backtest Engine", layout="wide")
 st.title("Nifty Option Backtest")
-st.caption("Sell the ATM straddle (call + put) N days before expiry. Max profit = credit collected; "
-           "exit at X% of it (target) or Y% of it as a loss (stop), otherwise at the time exit. "
-           "Monthly expiries only.")
+st.caption("Sell a call and a put N days before each monthly expiry. Max profit = credit collected; "
+           "exit at X% of it (target) or Y% of it as a loss (stop), otherwise at the time exit.")
+
+strategy = pick_strategy()
+if strategy is None:
+    st.info("Pick a strategy above to begin.")
+    st.stop()
 
 
 @st.cache_data(show_spinner=False)
@@ -44,11 +50,15 @@ data_min = pd.to_datetime(min(expiries)).date()
 data_max = pd.to_datetime(max(expiries)).date()
 
 with st.sidebar:
-    st.header("Strategy")
+    st.header(label(strategy))
     dte = st.number_input("Entry: days before expiry", 2, 120, 45)
     exit_dte = st.number_input("Time exit: days before expiry", 0, 119, 21)
     target_pct = st.number_input("Profit target (% of max profit / credit)", 1.0, 100.0, 50.0, step=5.0)
     stop_pct = st.number_input("Stop loss (% of credit, as a loss)", 1.0, 1000.0, 100.0, step=10.0)
+    if STRATEGIES[strategy]["has_n"]:
+        n = st.number_input("n: call = ATM + n, put = ATM - n (index points)", 0, 2000, 200, step=50)
+    else:
+        n = 0
     lot_size = st.number_input("Lot size", 1, 1000, 65)
     st.header("Expiry range")
     start = st.date_input("From", data_min, min_value=data_min, max_value=data_max)
@@ -65,15 +75,16 @@ if start > end:
 if go:
     with st.spinner("Running (each expiry takes a couple of seconds on the first run)..."):
         st.session_state["result"] = _run(DB_PATH, int(dte), float(target_pct), float(stop_pct),
-                                          int(lot_size), start, end, int(exit_dte))
+                                          int(lot_size), start, end, int(exit_dte), int(n))
+    st.session_state["result_strategy"] = strategy
     _t, _s, _k = st.session_state["result"]
     st.session_state["saved_path"] = None
     if _s["total_trades"]:
-        saved, full = save_run(_t.drop(columns=["skipped"]), ROOT / "results", expiries, int(dte),
-                               target_pct, stop_pct, int(exit_dte), start, end)
+        saved, full = save_run(strategy, _t.drop(columns=["skipped"]), ROOT / "results", expiries, int(dte),
+                               target_pct, stop_pct, int(exit_dte), start, end, int(n))
         st.session_state["saved_path"] = (str(saved), full)
 
-if "result" not in st.session_state:
+if st.session_state.get("result_strategy") != strategy:
     st.info("Set the parameters in the sidebar and press **Run backtest**.")
     st.stop()
 
@@ -93,7 +104,7 @@ else:
     trades = trades_df.drop(columns=["skipped"])
     if st.session_state.get("saved_path"):
         path, full = st.session_state["saved_path"]
-        st.caption(f"Saved to {path} -- " + ("full run, shows in Compare runs" if full
+        st.caption(f"Saved to {path} -- " + ("full run, shows in Compare runs for this strategy" if full
                    else "short run (range doesn't cover all the data), not in Compare runs"))
     st.subheader("Cumulative P&L")
     st.line_chart(pd.Series(trades["pnl"].cumsum().values, index=pd.to_datetime(trades["expiry"]), name="Cumulative P&L"))
