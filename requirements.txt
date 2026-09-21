@@ -1,0 +1,6 @@
+# Pinned to the versions this project was tested with (Python 3.14 venv).
+# The DuckDB file in data/ is read with duckdb 1.5.5.
+duckdb==1.5.5
+pandas==3.0.6
+numpy==2.5.3
+streamlit==1.64.0
