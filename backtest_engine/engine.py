@@ -1,19 +1,29 @@
 """
 backtest_engine/engine.py
 ==================================================
-Mechanical backtest: "sell a call and a put N days before expiry, exit at a
-profit target or stop loss, otherwise exit at the time-exit date (exit_dte
-days before expiry, default 21)" -- replayed across every monthly expiry.
+Mechanical backtest: sell (and, for the iron strategies, also buy) a set of
+options N days before expiry, exit at a profit target or stop loss, otherwise
+exit at the time-exit date (exit_dte days before expiry, default 21) --
+replayed across every monthly expiry.
 
-One engine serves both strategies via `offset` (n, in index points):
-  call strike = listed strike nearest to ATM + n
-  put  strike = listed strike nearest to ATM - n
-n = 0 is the short straddle; n > 0 is the short strangle.
+One engine serves every strategy via a `legs` list. Each leg is
+  {"name": "short_call" | "short_put" | "long_call" | "long_put",
+   "opt_type": "CE" | "PE", "side": "Sell" | "Buy", "offset": int}
+`offset` is in index points from the tick's ATM strike (the listed strike
+nearest spot); the strike used is the listed strike nearest ATM + offset.
+See backtest_engine/strategies.py for each strategy's leg list:
 
-Max profit of the short position is the total credit collected, so:
-  profit target = target_pct % of the credit  (buy back at credit * (1 - t))
-  stop loss     = stop_pct   % of the credit  (buy back at credit * (1 + s))
-Both are checked on the combined premium (call LTP + put LTP).
+  straddle     : short call @ 0,  short put @ 0
+  strangle     : short call @ +n, short put @ -n
+  iron_fly     : short call @ 0,  short put @ 0,  long call @ +w,  long put @ -w
+  iron_condor  : short call @ +n, short put @ -n, long call @ +var, long put @ -var
+
+Net credit = sum(sell leg entry prices) - sum(buy leg entry prices); this is
+also each strategy's max profit. Both are checked against the position's
+combined value (sum of sell-leg prices minus sum of buy-leg prices) each
+tick:
+  profit target = combined <= credit * (1 - target_pct / 100)
+  stop loss     = combined >= credit * (1 + stop_pct / 100)
 
 IMPORTANT: this is N independent per-expiry trials, not a single-portfolio
 simulation. Monthly expiries can overlap when dte is large; no shared-capital
@@ -24,6 +34,14 @@ import pandas as pd
 
 from .data import get_available_expiries, load_expiry_chain, get_option_price
 from .payoff import calculate_leg_pnl
+
+# The four possible leg names, in a fixed column order for the trade record.
+LEG_NAMES = ["short_call", "short_put", "long_call", "long_put"]
+
+DEFAULT_LEGS = [
+    {"name": "short_call", "opt_type": "CE", "side": "Sell", "offset": 0},
+    {"name": "short_put", "opt_type": "PE", "side": "Sell", "offset": 0},
+]
 
 
 def identify_monthly_expiries(expiries):
@@ -61,19 +79,29 @@ def find_entry_datetime(unique_times, expiry, dte):
     return None
 
 
-def _legs_price(df_indexed, t, call_strike, put_strike):
-    """(call, put) LTPs at one tick, or None if either leg has no price."""
-    ce = get_option_price(df_indexed, t, call_strike, "CE")
-    pe = get_option_price(df_indexed, t, put_strike, "PE")
-    if ce is None or pe is None:
-        return None
-    return ce, pe
+def _leg_prices(df_indexed, t, resolved_legs):
+    """{name: price} for every leg at one tick, or None if any leg has no
+    price there."""
+    prices = {}
+    for leg in resolved_legs:
+        price = get_option_price(df_indexed, t, leg["strike"], leg["opt_type"])
+        if price is None:
+            return None
+        prices[leg["name"]] = price
+    return prices
 
 
-def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte=21, offset=0):
-    """One full short call + put lifecycle for one expiry. Returns a dict --
-    either a completed trade record, or {"skipped": True, "expiry":...,
-    "reason":...} if it couldn't be simulated."""
+def _combined(prices, resolved_legs):
+    """Cost to close the position right now: buy back the sold legs, sell
+    the bought legs. Equals the net credit at entry."""
+    return sum(prices[l["name"]] if l["side"] == "Sell" else -prices[l["name"]] for l in resolved_legs)
+
+
+def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte=21, legs=None):
+    """One full lifecycle (all legs) for one expiry. Returns a dict -- either
+    a completed trade record, or {"skipped": True, "expiry":..., "reason":...}
+    if it couldn't be simulated. `legs` defaults to the short straddle."""
+    legs = legs if legs is not None else DEFAULT_LEGS
     df_indexed, unique_times, unique_strikes, spot_indexed = load_expiry_chain(db_path, expiry)
 
     if df_indexed.empty:
@@ -93,15 +121,17 @@ def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dt
     spot_at_entry = float(spot_indexed.loc[entry_dt, "spot_price"])
     nearest = lambda target: min(unique_strikes, key=lambda x: abs(x - target))
     atm_strike = nearest(spot_at_entry)
-    call_strike = nearest(atm_strike + offset)
-    put_strike = nearest(atm_strike - offset)
+    resolved_legs = [{**leg, "strike": nearest(atm_strike + leg["offset"])} for leg in legs]
 
-    entry_legs = _legs_price(df_indexed, entry_dt, call_strike, put_strike)
-    if entry_legs is None or min(entry_legs) <= 0:
+    entry_prices = _leg_prices(df_indexed, entry_dt, resolved_legs)
+    if entry_prices is None or min(entry_prices.values()) <= 0:
+        legs_desc = ", ".join(f"{l['name']} {l['strike']}" for l in resolved_legs)
         return {"skipped": True, "expiry": expiry,
-                "reason": f"No usable entry price for call {call_strike} / put {put_strike} on {entry_dt}."}
-    entry_ce, entry_pe = entry_legs
-    credit = entry_ce + entry_pe  # = max profit per share
+                "reason": f"No usable entry price for one or more legs ({legs_desc}) on {entry_dt}."}
+    credit = _combined(entry_prices, resolved_legs)  # = max profit per share
+    if credit <= 0:
+        return {"skipped": True, "expiry": expiry,
+                "reason": f"Net credit is not positive ({credit:.2f}) at entry -- not a credit trade here."}
 
     target_level = credit * (1 - target_pct / 100.0)  # combined at/below -> profit
     stop_level = credit * (1 + stop_pct / 100.0)      # combined at/above -> loss
@@ -115,75 +145,77 @@ def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dt
                 "reason": f"Data ends before the {exit_dte}-DTE time-exit date (trade would be incomplete)."}
 
     entry_idx = unique_times.index(entry_dt)
-    exit_dt = exit_legs = exit_reason = None
-    last_seen = None  # (tick, (ce, pe)) of the most recent tick with both prices
+    exit_dt = exit_prices = exit_reason = None
+    last_seen = None  # (tick, {name: price}) of the most recent tick with every leg priced
 
     for t in unique_times[entry_idx + 1:]:
         if t > time_exit_dt:
             break
-        legs = _legs_price(df_indexed, t, call_strike, put_strike)
-        if legs is None:
+        prices = _leg_prices(df_indexed, t, resolved_legs)
+        if prices is None:
             continue  # a missing tick for a leg -- keep walking, not a trigger
-        last_seen = (t, legs)
-        combined = legs[0] + legs[1]
+        last_seen = (t, prices)
+        combined = _combined(prices, resolved_legs)
         if combined <= target_level:
-            exit_dt, exit_legs, exit_reason = t, legs, "Profit Target"
+            exit_dt, exit_prices, exit_reason = t, prices, "Profit Target"
             break
         if combined >= stop_level:
-            exit_dt, exit_legs, exit_reason = t, legs, "Stop Loss"
+            exit_dt, exit_prices, exit_reason = t, prices, "Stop Loss"
             break
 
     if exit_dt is None:
         if last_seen is None:
             return {"skipped": True, "expiry": expiry,
-                    "reason": "No call+put price for the chosen strikes after entry."}
-        exit_dt, exit_legs = last_seen
+                    "reason": "No price for one or more legs at the chosen strikes after entry."}
+        exit_dt, exit_prices = last_seen
         exit_reason = f"Time Exit ({exit_dte} DTE)"
 
-    exit_ce, exit_pe = exit_legs
-    pnl = (calculate_leg_pnl(exit_ce, entry_ce, "Sell", 1, lot_size)
-           + calculate_leg_pnl(exit_pe, entry_pe, "Sell", 1, lot_size))
+    pnl = sum(calculate_leg_pnl(exit_prices[l["name"]], entry_prices[l["name"]], l["side"], 1, lot_size)
+              for l in resolved_legs)
     holding_days = (pd.to_datetime(exit_dt) - pd.to_datetime(entry_dt)).total_seconds() / 86400.0
     max_profit = credit * lot_size
 
-    return {
+    record = {
         "skipped": False,
         "expiry": expiry,
         "atm_strike": atm_strike,
-        "call_strike": call_strike,
-        "put_strike": put_strike,
+    }
+    by_name = {l["name"]: l for l in resolved_legs}
+    for name in LEG_NAMES:
+        leg = by_name.get(name)
+        record[f"{name}_strike"] = leg["strike"] if leg else None
+        record[f"{name}_entry"] = round(entry_prices[name], 2) if leg else None
+        record[f"{name}_exit"] = round(exit_prices[name], 2) if leg else None
+    record.update({
         "entry_datetime": entry_dt,
-        "entry_ce": round(entry_ce, 2),
-        "entry_pe": round(entry_pe, 2),
+        "exit_datetime": exit_dt,
+        "exit_reason": exit_reason,
         "credit": round(credit, 2),
         "max_profit": round(max_profit, 2),
-        "exit_datetime": exit_dt,
-        "exit_ce": round(exit_ce, 2),
-        "exit_pe": round(exit_pe, 2),
-        "exit_reason": exit_reason,
         "pnl": round(pnl, 2),
         "pnl_pct_of_max": round(pnl / max_profit * 100.0, 1),
         "holding_days": round(holding_days, 2),
-    }
+    })
+    return record
 
 
-def run_backtest(db_path, dte, target_pct, stop_pct, lot_size, start_date, end_date, exit_dte=21, offset=0):
+def run_backtest(db_path, dte, target_pct, stop_pct, lot_size, start_date, end_date, exit_dte=21, legs=None):
     """Sweeps every eligible monthly expiry. Returns (trades_df, summary, skipped_df).
 
     dte           -- calendar days before expiry to enter
-    target_pct    -- profit target: this % of the credit collected (max profit)
-    stop_pct      -- stop loss: this % of the credit collected, as a loss
-    lot_size      -- contract multiplier (one call + put pair is traded per expiry)
+    target_pct    -- profit target: this % of the net credit collected (max profit)
+    stop_pct      -- stop loss: this % of the net credit collected, as a loss
+    lot_size      -- contract multiplier (one set of legs is traded per expiry)
     start_date / end_date -- datetime.date bounds on the expiry date
     exit_dte      -- time exit: calendar days before expiry (must be < dte)
-    offset        -- n in index points: sell call at ATM+n, put at ATM-n (0 = straddle)
+    legs          -- the strategy's leg list (see module docstring); default is the straddle
     """
     all_expiries = get_available_expiries(db_path)
     eligible = filter_expiries(all_expiries, start_date, end_date)
 
     trades, skipped = [], []
     for expiry in eligible:
-        result = simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte, offset)
+        result = simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte, legs)
         (skipped if result.get("skipped") else trades).append(result)
 
     trades_df = pd.DataFrame(trades)

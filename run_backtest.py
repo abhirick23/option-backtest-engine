@@ -6,6 +6,13 @@ Command-line runner for the backtest engine.
     python run_backtest.py --strategy straddle --dte 45 --target-pct 50 --stop-pct 100 \
         --exit-dte 21 --start 2023-01-01 --end 2023-12-31
 
+    python run_backtest.py --strategy strangle --param n=200 ...
+    python run_backtest.py --strategy iron_fly --param w=300 ...
+    python run_backtest.py --strategy iron_condor --param n=200 --param var=500 ...
+
+--param key=value sets one of the strategy's own parameters (n, w, var -- see
+--list-strategies); a strategy's params default sensibly if you leave them out.
+
 Prints the summary and every trade, and writes the trades to results/*.csv.
 """
 
@@ -19,26 +26,43 @@ import pandas as pd
 from backtest_engine import run_backtest
 from backtest_engine.data import get_available_expiries
 from backtest_engine.storage import coverage_table, save_run
-from backtest_engine.strategies import STRATEGIES
+from backtest_engine.strategies import STRATEGIES, build_legs, default_params, label, validate_params
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
 
+def _print_strategies():
+    for key, s in STRATEGIES.items():
+        print(f"{key:12s} {label(key)}")
+        if s["params"]:
+            for spec in s["params"]:
+                print(f"             --param {spec['key']}=VALUE   {spec['label']} (default {spec['default']})")
+        print(f"             {s['brief']}")
+        print()
+
+
+def _parse_param(text):
+    if "=" not in text:
+        raise argparse.ArgumentTypeError(f"--param must be key=value, got {text!r}")
+    key, value = text.split("=", 1)
+    return key.strip(), float(value)
+
+
 def _parse_args():
     p = argparse.ArgumentParser(
-        description="Sell the ATM straddle N days before expiry; exit at X%% of the credit "
-                    "(profit target) or Y%% of the credit as a loss (stop), else at --exit-dte, "
-                    "replayed across monthly expiries."
+        description="Sell (and, for the iron strategies, buy) a set of options N days before "
+                    "expiry; exit at X%% of the net credit (profit target) or Y%% of it as a loss "
+                    "(stop), else at --exit-dte, replayed across monthly expiries."
     )
-    p.add_argument("--strategy", choices=list(STRATEGIES), default="straddle",
-                   help="straddle = sell ATM call+put; strangle = sell call at ATM+n and put at ATM-n")
-    p.add_argument("--n", type=int, default=200,
-                   help="strangle only: strike offset in index points, call=ATM+n / put=ATM-n (default 200)")
+    p.add_argument("--list-strategies", action="store_true", help="print every strategy and its params, then exit")
+    p.add_argument("--strategy", choices=list(STRATEGIES), default="straddle")
+    p.add_argument("--param", action="append", default=[], type=_parse_param, metavar="KEY=VALUE",
+                   help="set a strategy param (repeatable), e.g. --param n=200 --param var=500")
     p.add_argument("--dte", type=int, default=45, help="calendar days before expiry to enter (default 45)")
     p.add_argument("--target-pct", type=float, default=50.0,
-                   help="profit target: %% of the credit collected, i.e. of max profit (default 50)")
+                   help="profit target: %% of the net credit collected, i.e. of max profit (default 50)")
     p.add_argument("--stop-pct", type=float, default=100.0,
-                   help="stop loss: %% of the credit collected, taken as a loss (default 100)")
+                   help="stop loss: %% of the net credit collected, taken as a loss (default 100)")
     p.add_argument("--lot-size", type=int, default=65, help="contract multiplier (default 65)")
     p.add_argument("--exit-dte", type=int, default=21,
                    help="time exit: calendar days before expiry to close if no target/stop hit (default 21)")
@@ -47,12 +71,28 @@ def _parse_args():
     p.add_argument("--end", type=datetime.date.fromisoformat, default=None,
                    help="last expiry date to include, YYYY-MM-DD (default: latest in the data)")
     p.add_argument("--db", default=str(ROOT / "data" / "market_data.duckdb"), help="path to the DuckDB file")
-    p.add_argument("--out-dir", default=str(ROOT / "results"), help="results root; full runs go to <root>/<strategy>, shorter runs to <root>/<strategy>_short_runs")
+    p.add_argument("--out-dir", default=str(ROOT / "results"),
+                   help="results root; full runs go to <root>/<strategy>, shorter runs to <root>/<strategy>_short_runs")
     return p.parse_args()
 
 
 def main():
     args = _parse_args()
+
+    if args.list_strategies:
+        _print_strategies()
+        return
+
+    params = default_params(args.strategy)
+    valid_keys = set(params)
+    for key, value in args.param:
+        if key not in valid_keys:
+            sys.exit(f"'{key}' is not a param of --strategy {args.strategy}. "
+                     f"Valid params: {sorted(valid_keys) or '(none)'}. Try --list-strategies.")
+        params[key] = int(value) if value.is_integer() else value
+    err = validate_params(args.strategy, params)
+    if err:
+        sys.exit(f"Invalid params for --strategy {args.strategy}: {err}")
 
     db_file = pathlib.Path(args.db)
     if not db_file.is_file():
@@ -65,15 +105,16 @@ def main():
     if start > end:
         sys.exit(f"--start ({start}) is after --end ({end}).")
 
-    n = args.n if STRATEGIES[args.strategy]["has_n"] else 0
-    what = f"strangle (call ATM+{n} / put ATM-{n})" if n else "ATM straddle"
-    print(f"Rule: sell {what}, enter {args.dte} DTE, target {args.target_pct:g}% / "
-          f"stop {args.stop_pct:g}% of credit, time exit {args.exit_dte} DTE, lot size {args.lot_size}")
+    param_desc = ", ".join(f"{k}={v}" for k, v in params.items())
+    print(f"Rule: {label(args.strategy)}" + (f" ({param_desc})" if param_desc else "") +
+          f", enter {args.dte} DTE, target {args.target_pct:g}% / stop {args.stop_pct:g}% of net credit, "
+          f"time exit {args.exit_dte} DTE, lot size {args.lot_size}")
     print(f"Sweep: monthly expiries from {start} to {end}")
     print("Running (each expiry takes a couple of seconds to load)...\n")
 
+    legs = build_legs(args.strategy, params)
     trades_df, summary, skipped_df = run_backtest(
-        db_path, args.dte, args.target_pct, args.stop_pct, args.lot_size, start, end, args.exit_dte, n
+        db_path, args.dte, args.target_pct, args.stop_pct, args.lot_size, start, end, args.exit_dte, legs
     )
 
     if summary["total_trades"] == 0:
@@ -91,7 +132,7 @@ def main():
         print(f"Worst trade     : {summary['worst_trade']:,.2f}")
 
         trades_path, full = save_run(args.strategy, trades_df, pathlib.Path(args.out_dir), expiries, args.dte,
-                                     args.target_pct, args.stop_pct, args.exit_dte, start, end, n)
+                                     params, args.target_pct, args.stop_pct, args.exit_dte, start, end)
         kind = "FULL run (counts in Compare runs)" if full else "short run (not in Compare runs)"
         print(f"\nTrades written to {trades_path}  -- {kind}")
 

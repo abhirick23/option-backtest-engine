@@ -15,15 +15,16 @@ from backtest_engine import run_backtest
 from backtest_engine.data import get_available_expiries
 from app_common import pick_strategy
 from backtest_engine.storage import coverage_table, save_run
-from backtest_engine.strategies import STRATEGIES, label
+from backtest_engine.strategies import STRATEGIES, build_legs, label, validate_params
 
 ROOT = pathlib.Path(__file__).resolve().parent
 DB_PATH = str(ROOT / "data" / "market_data.duckdb")
 
 st.set_page_config(page_title="Nifty Backtest Engine", layout="wide")
 st.title("Nifty Option Backtest")
-st.caption("Sell a call and a put N days before each monthly expiry. Max profit = credit collected; "
-           "exit at X% of it (target) or Y% of it as a loss (stop), otherwise at the time exit.")
+st.caption("Sell (and, for the iron strategies, buy) a set of options N days before each monthly "
+           "expiry. Max profit = net credit collected; exit at X% of it (target) or Y% of it as a "
+           "loss (stop), otherwise at the time exit.")
 
 strategy = pick_strategy()
 if strategy is None:
@@ -55,10 +56,10 @@ with st.sidebar:
     exit_dte = st.number_input("Time exit: days before expiry", 0, 119, 21)
     target_pct = st.number_input("Profit target (% of max profit / credit)", 1.0, 100.0, 50.0, step=5.0)
     stop_pct = st.number_input("Stop loss (% of credit, as a loss)", 1.0, 1000.0, 100.0, step=10.0)
-    if STRATEGIES[strategy]["has_n"]:
-        n = st.number_input("n: call = ATM + n, put = ATM - n (index points)", 0, 2000, 200, step=50)
-    else:
-        n = 0
+    params = {}
+    for spec in STRATEGIES[strategy]["params"]:
+        params[spec["key"]] = st.number_input(spec["label"], spec["min"], spec["max"], spec["default"],
+                                              step=spec["step"])
     lot_size = st.number_input("Lot size", 1, 1000, 65)
     st.header("Expiry range")
     start = st.date_input("From", data_min, min_value=data_min, max_value=data_max)
@@ -71,17 +72,22 @@ if exit_dte >= dte:
 if start > end:
     st.error("'From' is after 'To'.")
     st.stop()
+param_error = validate_params(strategy, params)
+if param_error:
+    st.error(param_error)
+    st.stop()
 
 if go:
+    legs = build_legs(strategy, params)
     with st.spinner("Running (each expiry takes a couple of seconds on the first run)..."):
         st.session_state["result"] = _run(DB_PATH, int(dte), float(target_pct), float(stop_pct),
-                                          int(lot_size), start, end, int(exit_dte), int(n))
+                                          int(lot_size), start, end, int(exit_dte), legs)
     st.session_state["result_strategy"] = strategy
     _t, _s, _k = st.session_state["result"]
     st.session_state["saved_path"] = None
     if _s["total_trades"]:
         saved, full = save_run(strategy, _t.drop(columns=["skipped"]), ROOT / "results", expiries, int(dte),
-                               target_pct, stop_pct, int(exit_dte), start, end, int(n))
+                               params, target_pct, stop_pct, int(exit_dte), start, end)
         st.session_state["saved_path"] = (str(saved), full)
 
 if st.session_state.get("result_strategy") != strategy:
