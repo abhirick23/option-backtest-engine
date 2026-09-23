@@ -8,15 +8,19 @@ replayed across every monthly expiry.
 
 One engine serves every strategy via a `legs` list. Each leg is
   {"name": "short_call" | "short_put" | "long_call" | "long_put",
-   "opt_type": "CE" | "PE", "side": "Sell" | "Buy", "offset": int}
-`offset` is in index points from the tick's ATM strike (the listed strike
-nearest spot); the strike used is the listed strike nearest ATM + offset.
+   "opt_type": "CE" | "PE", "side": "Sell" | "Buy",
+   "offset": int   OR   "delta": float}
+A leg is placed either by `offset` -- index points from the tick's ATM strike
+(the listed strike nearest spot); the strike used is the listed strike nearest
+ATM + offset -- or by `delta`: the listed strike whose absolute delta at the
+entry tick is closest to that value (0..1).
 See backtest_engine/strategies.py for each strategy's leg list:
 
-  straddle     : short call @ 0,  short put @ 0
-  strangle     : short call @ +n, short put @ -n
-  iron_fly     : short call @ 0,  short put @ 0,  long call @ +w,  long put @ -w
-  iron_condor  : short call @ +n, short put @ -n, long call @ +var, long put @ -var
+  straddle     : short call @ 0,  short put @ 0                              (offsets)
+  strangle     : short call @ +n, short put @ -n                             (offsets)
+  iron_fly     : short call @ 0,  short put @ 0,  long call @ +w,  long put @ -w   (offsets)
+  iron_condor  : sold call / put at delta sd, bought call / put at delta wd
+                 (wd < sd, so the wings sit further out)                     (deltas)
 
 Net credit = sum(sell leg entry prices) - sum(buy leg entry prices); this is
 also each strategy's max profit. Both are checked against the position's
@@ -32,7 +36,7 @@ or margin constraint is modeled.
 
 import pandas as pd
 
-from .data import get_available_expiries, load_expiry_chain, get_option_price
+from .data import get_available_expiries, load_expiry_chain, get_option_price, strike_by_delta
 from .payoff import calculate_leg_pnl
 
 # The four possible leg names, in a fixed column order for the trade record.
@@ -91,6 +95,12 @@ def _leg_prices(df_indexed, t, resolved_legs):
     return prices
 
 
+def _entry_delta(df_indexed, t, leg):
+    """The leg's absolute delta at the entry tick (recorded for delta-placed legs)."""
+    col = "call_delta" if leg["opt_type"] == "CE" else "put_delta"
+    return round(abs(float(df_indexed.loc[(t, int(leg["strike"])), col])), 4)
+
+
 def _combined(prices, resolved_legs):
     """Cost to close the position right now: buy back the sold legs, sell
     the bought legs. Equals the net credit at entry."""
@@ -121,7 +131,28 @@ def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dt
     spot_at_entry = float(spot_indexed.loc[entry_dt, "spot_price"])
     nearest = lambda target: min(unique_strikes, key=lambda x: abs(x - target))
     atm_strike = nearest(spot_at_entry)
-    resolved_legs = [{**leg, "strike": nearest(atm_strike + leg["offset"])} for leg in legs]
+    resolved_legs = []
+    for leg in legs:
+        if "delta" in leg:
+            strike = strike_by_delta(df_indexed, entry_dt, leg["opt_type"], leg["delta"])
+            if strike is None:
+                return {"skipped": True, "expiry": expiry,
+                        "reason": f"No delta data at the entry tick {entry_dt} to place {leg['name']}."}
+        else:
+            strike = nearest(atm_strike + leg["offset"])
+        resolved_legs.append({**leg, "strike": strike})
+
+    # A bought wing must sit strictly further out than the sold leg of the same
+    # type (calls: higher strike, puts: lower strike), or the pair degenerates.
+    sold = {l["opt_type"]: l for l in resolved_legs if l["side"] == "Sell"}
+    for leg in resolved_legs:
+        short = sold.get(leg["opt_type"])
+        if leg["side"] == "Buy" and short is not None:
+            further = leg["strike"] > short["strike"] if leg["opt_type"] == "CE" else leg["strike"] < short["strike"]
+            if not further:
+                return {"skipped": True, "expiry": expiry,
+                        "reason": f"{leg['name']} {leg['strike']} is not further out than "
+                                  f"{short['name']} {short['strike']} at {entry_dt}."}
 
     entry_prices = _leg_prices(df_indexed, entry_dt, resolved_legs)
     if entry_prices is None or min(entry_prices.values()) <= 0:
@@ -184,6 +215,7 @@ def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dt
     for name in LEG_NAMES:
         leg = by_name.get(name)
         record[f"{name}_strike"] = leg["strike"] if leg else None
+        record[f"{name}_delta"] = _entry_delta(df_indexed, entry_dt, leg) if leg and "delta" in leg else None
         record[f"{name}_entry"] = round(entry_prices[name], 2) if leg else None
         record[f"{name}_exit"] = round(exit_prices[name], 2) if leg else None
     record.update({

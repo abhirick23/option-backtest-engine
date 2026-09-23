@@ -15,7 +15,7 @@ from backtest_engine import run_backtest
 from backtest_engine.data import get_available_expiries
 from app_common import pick_strategy
 from backtest_engine.storage import coverage_table, save_run
-from backtest_engine.strategies import STRATEGIES, build_legs, label, validate_params
+from backtest_engine.strategies import STRATEGIES, build_legs, default_rule, label, validate_params
 
 ROOT = pathlib.Path(__file__).resolve().parent
 DB_PATH = str(ROOT / "data" / "market_data.duckdb")
@@ -54,8 +54,9 @@ with st.sidebar:
     st.header(label(strategy))
     dte = st.number_input("Entry: days before expiry", 2, 120, 45)
     exit_dte = st.number_input("Time exit: days before expiry", 0, 119, 21)
-    target_pct = st.number_input("Profit target (% of max profit / credit)", 1.0, 100.0, 50.0, step=5.0)
-    stop_pct = st.number_input("Stop loss (% of credit, as a loss)", 1.0, 1000.0, 100.0, step=10.0)
+    default_target, default_stop = default_rule(strategy)
+    target_pct = st.number_input("Profit target (% of max profit / credit)", 1.0, 100.0, default_target, step=1.0)
+    stop_pct = st.number_input("Stop loss (% of credit, as a loss)", 1.0, 1000.0, default_stop, step=5.0)
     params = {}
     for spec in STRATEGIES[strategy]["params"]:
         params[spec["key"]] = st.number_input(spec["label"], spec["min"], spec["max"], spec["default"],

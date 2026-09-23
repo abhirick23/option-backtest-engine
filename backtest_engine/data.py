@@ -23,11 +23,14 @@ SPOT_COL = "spot_price"
 STRIKE_COL = "strike_price"
 CALL_LTP_COL = "call_ltp"
 PUT_LTP_COL = "put_ltp"
+CALL_DELTA_COL = "call_delta"   # 0 .. 1
+PUT_DELTA_COL = "put_delta"     # -1 .. 0
 
-# The only columns the engine reads. The table also has OI / IV / Greeks /
-# volume (call_oi, call_iv, call_delta, put_theta, ...) -- add them here if a
-# future strategy needs them; nothing else in this file has to change.
-CHAIN_COLUMNS = [DATE_COL, TIME_COL, EXPIRY_COL, SPOT_COL, STRIKE_COL, CALL_LTP_COL, PUT_LTP_COL]
+# The only columns the engine reads. The table also has OI / IV / other Greeks /
+# volume (call_oi, call_iv, put_theta, ...) -- add them here if a future
+# strategy needs them; nothing else in this file has to change.
+CHAIN_COLUMNS = [DATE_COL, TIME_COL, EXPIRY_COL, SPOT_COL, STRIKE_COL, CALL_LTP_COL, PUT_LTP_COL,
+                 CALL_DELTA_COL, PUT_DELTA_COL]
 
 # The archive mixes several date-string formats across quarters, so dates are
 # normalised in SQL rather than trusted as-is.
@@ -115,6 +118,8 @@ def load_expiry_chain(db_path, expiry_date):
     df[SPOT_COL] = pd.to_numeric(df[SPOT_COL], errors="coerce")
     df[CALL_LTP_COL] = pd.to_numeric(df[CALL_LTP_COL], errors="coerce")
     df[PUT_LTP_COL] = pd.to_numeric(df[PUT_LTP_COL], errors="coerce")
+    df[CALL_DELTA_COL] = pd.to_numeric(df[CALL_DELTA_COL], errors="coerce")
+    df[PUT_DELTA_COL] = pd.to_numeric(df[PUT_DELTA_COL], errors="coerce")
 
     df = df.dropna(subset=[TIME_COL, STRIKE_COL, SPOT_COL, "clean_date"])
 
@@ -153,3 +158,21 @@ def get_option_price(df_indexed, selected_datetime, strike, opt_type):
     col = CALL_LTP_COL if opt_type == "CE" else PUT_LTP_COL
     val = row.get(col, None)
     return None if pd.isna(val) else float(val)
+
+
+def strike_by_delta(df_indexed, selected_datetime, opt_type, target_delta):
+    """The listed strike at one tick whose absolute delta is closest to
+    target_delta (0..1); ties go to the lower strike. Only strikes with a
+    traded price (LTP > 0) are considered -- a strike with no price can't be
+    traded, and at the 09:20 tick many far strikes haven't traded yet. None if
+    no strike qualifies. Calls use call_delta, puts use |put_delta|."""
+    try:
+        snap = df_indexed.xs(selected_datetime, level=0)
+    except KeyError:
+        return None
+    dcol, pcol = (CALL_DELTA_COL, CALL_LTP_COL) if opt_type == "CE" else (PUT_DELTA_COL, PUT_LTP_COL)
+    tradable = snap[snap[pcol] > 0]
+    deltas = tradable[dcol].dropna().abs()
+    if deltas.empty:
+        return None
+    return int((deltas - target_delta).abs().idxmin())

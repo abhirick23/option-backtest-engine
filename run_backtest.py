@@ -8,9 +8,9 @@ Command-line runner for the backtest engine.
 
     python run_backtest.py --strategy strangle --param n=200 ...
     python run_backtest.py --strategy iron_fly --param w=300 ...
-    python run_backtest.py --strategy iron_condor --param n=200 --param var=500 ...
+    python run_backtest.py --strategy iron_condor --param sd=30 --param wd=10 ...
 
---param key=value sets one of the strategy's own parameters (n, w, var -- see
+--param key=value sets one of the strategy's own parameters (n, w, sd, wd -- see
 --list-strategies); a strategy's params default sensibly if you leave them out.
 
 Prints the summary and every trade, and writes the trades to results/*.csv.
@@ -26,7 +26,8 @@ import pandas as pd
 from backtest_engine import run_backtest
 from backtest_engine.data import get_available_expiries
 from backtest_engine.storage import coverage_table, save_run
-from backtest_engine.strategies import STRATEGIES, build_legs, default_params, label, validate_params
+from backtest_engine.strategies import (STRATEGIES, build_legs, default_params, default_rule, label,
+                                        validate_params)
 
 ROOT = pathlib.Path(__file__).resolve().parent
 
@@ -57,12 +58,14 @@ def _parse_args():
     p.add_argument("--list-strategies", action="store_true", help="print every strategy and its params, then exit")
     p.add_argument("--strategy", choices=list(STRATEGIES), default="straddle")
     p.add_argument("--param", action="append", default=[], type=_parse_param, metavar="KEY=VALUE",
-                   help="set a strategy param (repeatable), e.g. --param n=200 --param var=500")
+                   help="set a strategy param (repeatable), e.g. --param sd=30 --param wd=10")
     p.add_argument("--dte", type=int, default=45, help="calendar days before expiry to enter (default 45)")
-    p.add_argument("--target-pct", type=float, default=50.0,
-                   help="profit target: %% of the net credit collected, i.e. of max profit (default 50)")
-    p.add_argument("--stop-pct", type=float, default=100.0,
-                   help="stop loss: %% of the net credit collected, taken as a loss (default 100)")
+    p.add_argument("--target-pct", type=float, default=None,
+                   help="profit target: %% of the net credit collected, i.e. of max profit "
+                        "(default 50; 33 for iron_fly / iron_condor)")
+    p.add_argument("--stop-pct", type=float, default=None,
+                   help="stop loss: %% of the net credit collected, taken as a loss "
+                        "(default 100; 50 for iron_fly / iron_condor)")
     p.add_argument("--lot-size", type=int, default=65, help="contract multiplier (default 65)")
     p.add_argument("--exit-dte", type=int, default=21,
                    help="time exit: calendar days before expiry to close if no target/stop hit (default 21)")
@@ -82,6 +85,12 @@ def main():
     if args.list_strategies:
         _print_strategies()
         return
+
+    default_target, default_stop = default_rule(args.strategy)
+    if args.target_pct is None:
+        args.target_pct = default_target
+    if args.stop_pct is None:
+        args.stop_pct = default_stop
 
     params = default_params(args.strategy)
     valid_keys = set(params)

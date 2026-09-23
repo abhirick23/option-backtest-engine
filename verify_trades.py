@@ -6,9 +6,9 @@ the DuckDB file: it re-reads data/raw_parquet/*.parquet and replays every
 trade tick by tick, then reports PASS/FAIL per trade.
 
     python verify_trades.py results/straddle/backtest_straddle_45dte_t50_s100_exit21_....csv
-    python verify_trades.py results/iron_condor/backtest_iron_condor_45dte_n200_var500_...csv
+    python verify_trades.py results/iron_condor/backtest_iron_condor_45dte_sd30_wd10_...csv
 
-The strategy and its rule parameters (dte, n/w/var, target %, stop %, exit dte)
+The strategy and its rule parameters (dte, n/w/sd/wd, target %, stop %, exit dte)
 are parsed from the file name (see backtest_engine/storage.py); override any of
 them with --strategy/--dte/--param key=value/--target-pct/--stop-pct/--exit-dte/
 --lot-size. Works for every strategy in backtest_engine/strategies.py -- it
@@ -18,7 +18,10 @@ long_call, long_put) and re-derives each leg's strike independently.
 Per trade it checks:
   1. entry tick   = first tick on/after (expiry - dte days)
   2. strikes      = ATM is the listed strike nearest to spot at that tick; each
-                    leg's strike is the listed strike nearest ATM + its offset
+                    leg's strike is the listed strike nearest ATM + its offset,
+                    or (iron condor) the strike whose |delta| at that tick is
+                    closest to the leg's target delta among strikes with a
+                    traded price (LTP > 0)
   3. entry prices + net credit match the raw prices
   4. exit tick    = the FIRST tick where the combined position value (sum of
                     sold legs minus sum of bought legs) crosses the target or
@@ -144,7 +147,8 @@ def main():
     base = f"""
         SELECT {exp_n} AS expiry, {date_n} AS d, {time_n} AS t,
                CAST(strike_price AS INTEGER) AS strike,
-               spot_price AS spot, call_ltp AS ce, put_ltp AS pe
+               spot_price AS spot, call_ltp AS ce, put_ltp AS pe,
+               call_delta AS cd, put_delta AS pdl
         FROM read_parquet('{PARQUET}')
     """
     print("Reading raw parquet (one pass)...")
@@ -203,7 +207,7 @@ def main():
             errs.append(f"entry tick {tr.entry_datetime} != expected {exp_entry_dt}")
 
         # 2. ATM, then each leg's strike, from the full chain at that tick
-        snap = ec[ec["t"] == first_t]
+        snap = ec[ec["t"] == first_t].sort_values("strike")
         spot0 = float(snap["spot"].iloc[0])
         listed = snap["strike"].astype(int)
         nearest = lambda target: int(listed.iloc[(listed - target).abs().argmin()])
@@ -211,11 +215,22 @@ def main():
         if tr.atm_strike != atm:
             errs.append(f"atm strike {tr.atm_strike} != nearest-to-spot {atm} (spot {spot0})")
         for leg in legs:
-            exp_strike = nearest(atm + leg["offset"])
             csv_strike = getattr(tr, f"{leg['name']}_strike")
+            if "delta" in leg:
+                dcol, pcol = ("cd", "ce") if leg["opt_type"] == "CE" else ("pdl", "pe")
+                tradable = snap[snap[pcol] > 0]  # only strikes that have a traded price
+                deltas = tradable.set_index("strike")[dcol].dropna().abs()
+                exp_strike = int((deltas - leg["delta"]).abs().idxmin())
+                how = f"target |delta| {leg['delta']:g}"
+                if csv_strike == exp_strike and hasattr(tr, f"{leg['name']}_delta"):
+                    raw_delta, csv_delta = float(deltas[exp_strike]), getattr(tr, f"{leg['name']}_delta")
+                    if abs(raw_delta - csv_delta) > 0.0002:
+                        errs.append(f"{leg['name']} delta csv {csv_delta} vs raw {raw_delta:.4f}")
+            else:
+                exp_strike = nearest(atm + leg["offset"])
+                how = f"offset {leg['offset']:+d}"
             if csv_strike != exp_strike:
-                errs.append(f"{leg['name']} strike {csv_strike} != expected {exp_strike} "
-                            f"(offset {leg['offset']:+d})")
+                errs.append(f"{leg['name']} strike {csv_strike} != expected {exp_strike} ({how})")
 
         # 3. entry prices + net credit
         e = p[p["dt"] == tr.entry_datetime]

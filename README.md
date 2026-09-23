@@ -9,12 +9,18 @@ independent result checker. Four strategies share one engine:
 | 1 | **Short Straddle** | sell ATM call + sell ATM put |
 | 2 | **Short Strangle** | sell call at ATM **+ n**, sell put at ATM **- n** |
 | 3 | **Iron Fly** | Strategy 1 + buy call at ATM **+ w**, buy put at ATM **- w** |
-| 4 | **Iron Condor** | Strategy 2 + buy call at ATM **+ var**, buy put at ATM **- var** (`var > n`) |
+| 4 | **Iron Condor** | sell call + put at delta **sd**, buy call + put (wings) at delta **wd** (`wd < sd`) |
 
-`n`, `w`, `var` are index points and snap to the nearest listed strike. `n = 0`
-makes the strangle identical to the straddle. New strategies are added in
-`backtest_engine/strategies.py` -- one entry with a leg list and its own
-params, nothing else needs to change.
+`n` and `w` are index points and snap to the nearest listed strike; `n = 0`
+makes the strangle identical to the straddle. The iron condor places its legs
+by **delta** instead: `sd = 30, wd = 10` means sold legs at ~30-delta and
+wings at ~10-delta, chosen at entry among strikes that have a traded price
+(many far strikes show LTP 0 at the 09:20 tick, so they can't be traded). New
+strategies are added in `backtest_engine/strategies.py` -- one entry with a leg
+list and its own params, nothing else needs to change.
+
+Default exit rule: target 50% / stop 100% of the credit for the straddle and
+strangle, **33% / 50%** for the iron fly and iron condor.
 
 ## The rule
 
@@ -45,7 +51,8 @@ py -m venv .venv
 
 **The data is not in this repo.** Put the option-chain database at
 `data/market_data.duckdb` (table `option_chain_snapshots`, columns incl.
-`pulled_date, pulled_time, expiry, spot_price, strike_price, call_ltp, put_ltp`).
+`pulled_date, pulled_time, expiry, spot_price, strike_price, call_ltp, put_ltp,
+call_delta, put_delta`).
 To use `verify_trades.py` you also need the raw quarterly parquet files in
 `data/raw_parquet/`. The `data/` and `results/` folders are git-ignored;
 `results/` and its sub-folders are created automatically on the first run.
@@ -54,7 +61,7 @@ To use `verify_trades.py` you also need the raw quarterly parquet files in
 
 **App** -- double-click `run_app.bat` (or `.venv\Scripts\streamlit run app.py`).
 It first asks which strategy you are testing (the ❗ About box explains it),
-then shows that strategy's own parameters (n / w / var) in the sidebar. The
+then shows that strategy's own parameters (n / w / sd, wd) in the sidebar. The
 home page runs a backtest; **Compare runs** compares the saved full runs of
 the strategy you picked.
 
@@ -64,7 +71,7 @@ the strategy you picked.
 .venv\Scripts\python run_backtest.py --strategy straddle --dte 45 --target-pct 50 --stop-pct 100
 .venv\Scripts\python run_backtest.py --strategy strangle --param n=200 ...
 .venv\Scripts\python run_backtest.py --strategy iron_fly --param w=300 ...
-.venv\Scripts\python run_backtest.py --strategy iron_condor --param n=200 --param var=500 ...
+.venv\Scripts\python run_backtest.py --strategy iron_condor --param sd=30 --param wd=10 ...
 .venv\Scripts\python run_backtest.py --list-strategies   # every strategy, its params and a brief
 ```
 
@@ -74,8 +81,8 @@ the strategy you picked.
 | `--param key=value` | (per strategy) | set one of the strategy's own params; repeatable |
 | `--dte` | 45 | days before expiry to enter |
 | `--exit-dte` | 21 | time exit, days before expiry (must be < `--dte`) |
-| `--target-pct` | 50 | profit target, % of the net credit (max profit) |
-| `--stop-pct` | 100 | stop loss, % of the net credit taken as a loss |
+| `--target-pct` | 50 (33 for iron strategies) | profit target, % of the net credit (max profit) |
+| `--stop-pct` | 100 (50 for iron strategies) | stop loss, % of the net credit taken as a loss |
 | `--lot-size` | 65 | contract multiplier |
 | `--start` / `--end` | whole archive | bounds on the **expiry** date, `YYYY-MM-DD` |
 | `--db` | `data/market_data.duckdb` | DuckDB file |
@@ -87,12 +94,13 @@ the strategy you picked.
   `results/<strategy>/` (what the Compare runs page shows for that strategy).
 - Any narrower run -> `results/<strategy>_short_runs/` (saved, not compared).
 - File names carry the settings, e.g.
-  `backtest_iron_condor_45dte_n200_var500_t50_s100_exit21_<start>_<end>.csv`.
+  `backtest_iron_condor_45dte_sd30_wd10_t33_s50_exit21_<start>_<end>.csv`.
 - Every run prints/shows a **coverage checklist**: each eligible expiry ticked if
   traded, or unticked with the skip reason (e.g. data ends before the time exit).
 - Each trade row has `atm_strike` plus, for every leg the strategy uses,
   `<leg>_strike` / `<leg>_entry` / `<leg>_exit` (leg names: `short_call`,
-  `short_put`, and for the iron strategies `long_call`, `long_put`).
+  `short_put`, and for the iron strategies `long_call`, `long_put`); legs placed
+  by delta also record `<leg>_delta`.
 
 **Verify a run** (independent recompute from the raw parquet, no engine code):
 
