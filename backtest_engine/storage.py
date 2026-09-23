@@ -21,7 +21,7 @@ from .strategies import STRATEGIES
 
 _NAME = re.compile(
     r"backtest_(?P<strategy>[a-z]+(?:_[a-z]+)*?)_(?P<dte>\d+)dte(?P<params>(?:_[a-z]+[\d.]+)*)"
-    r"_t(?P<t>[\d.]+)_s(?P<s>[\d.]+)_exit(?P<x>\d+)_(?P<start>\d{4}-\d{2}-\d{2})_(?P<end>\d{4}-\d{2}-\d{2})"
+    r"_t(?P<t>[\d.]+)_s(?P<s>[\d.]+)_exit(?P<x>\d+)(?:_at(?P<at>\d{4}))?_(?P<start>\d{4}-\d{2}-\d{2})_(?P<end>\d{4}-\d{2}-\d{2})"
 )
 _PARAM_PART = re.compile(r"_([a-z]+)([\d.]+)")
 
@@ -41,11 +41,14 @@ def is_full_run(start, end, expiries):
     return start <= first and end >= last
 
 
-def run_stem(strategy, dte, params, target_pct, stop_pct, exit_dte, start, end):
-    """params -- dict of the strategy's own parameters, e.g. {"n": 200}."""
+def run_stem(strategy, dte, params, target_pct, stop_pct, exit_dte, start, end, entry_time=None):
+    """params -- dict of the strategy's own parameters, e.g. {"n": 200}.
+    entry_time -- "HH:MM[:SS]" the run traded at; None (the older 09:20-open
+    runs) leaves it out of the name."""
     param_part = "".join(f"_{spec['key']}{params[spec['key']]:g}" for spec in STRATEGIES[strategy]["params"])
+    at_part = f"_at{entry_time[:5].replace(':', '')}" if entry_time else ""
     return (f"backtest_{strategy}_{dte}dte{param_part}_t{target_pct:g}_s{stop_pct:g}"
-            f"_exit{exit_dte}_{start}_{end}")
+            f"_exit{exit_dte}{at_part}_{start}_{end}")
 
 
 def parse_run_name(stem):
@@ -57,24 +60,27 @@ def parse_run_name(stem):
     return {
         "strategy": m["strategy"], "dte": int(m["dte"]), "params": params,
         "target_pct": float(m["t"]), "stop_pct": float(m["s"]), "exit_dte": int(m["x"]),
+        "entry_time": f"{m['at'][:2]}:{m['at'][2:]}" if m["at"] else None,
         "start": m["start"], "end": m["end"],
     }
 
 
 def run_label(info):
     param_part = "".join(f" | {k}={v:g}" for k, v in info["params"].items())
-    return (f"{info['dte']}→{info['exit_dte']} DTE{param_part} | target {info['target_pct']:g}% | "
+    at_part = f" | @{info['entry_time']}" if info.get("entry_time") else ""
+    return (f"{info['dte']}→{info['exit_dte']} DTE{param_part}{at_part} | target {info['target_pct']:g}% | "
             f"stop {info['stop_pct']:g}% | {info['start']} to {info['end']}")
 
 
 def save_run(strategy, trades_df, results_root, expiries, dte, params, target_pct, stop_pct, exit_dte,
-             start, end):
+             start, end, entry_time=None):
     """Write the trades CSV into the strategy's full-run or short-run folder.
     Returns (path, is_full)."""
     full = is_full_run(start, end, expiries)
     out_dir = results_root / (full_dir(strategy) if full else short_dir(strategy))
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{run_stem(strategy, dte, params, target_pct, stop_pct, exit_dte, start, end)}.csv"
+    stem = run_stem(strategy, dte, params, target_pct, stop_pct, exit_dte, start, end, entry_time)
+    path = out_dir / f"{stem}.csv"
     trades_df.to_csv(path, index=False)
     return path, full
 

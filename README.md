@@ -19,14 +19,17 @@ wings at ~10-delta, chosen at entry among strikes that have a traded price
 strategies are added in `backtest_engine/strategies.py` -- one entry with a leg
 list and its own params, nothing else needs to change.
 
-Default exit rule: target 50% / stop 100% of the credit for the straddle and
-strangle, **33% / 50%** for the iron fly and iron condor.
+Default exit rule: target 50% / stop 100% of the net credit for every strategy.
+Default time exit: 21 DTE, except the iron fly (**15 DTE**) and iron condor
+(**10 DTE**). Trades are opened and time-exited at **15:15** (the first 5-minute
+tick at/after it), not at the 09:20 open; use `--entry-time 09:20` for the old
+behaviour.
 
 ## The rule
 
 For every **monthly** expiry in the chosen range:
 
-1. **Entry** -- `dte` calendar days before expiry, at the first available tick,
+1. **Entry** -- `dte` calendar days before expiry, at 15:15 (first tick at/after it),
    put on the strategy's legs (ATM = strike nearest spot at that tick; each
    leg's own strike is the listed strike nearest ATM + its offset).
 2. **Max profit** is the **net credit**: what the sold legs bring in minus what
@@ -80,9 +83,10 @@ the strategy you picked.
 | `--strategy` | straddle | `straddle`, `strangle`, `iron_fly` or `iron_condor` |
 | `--param key=value` | (per strategy) | set one of the strategy's own params; repeatable |
 | `--dte` | 45 | days before expiry to enter |
-| `--exit-dte` | 21 | time exit, days before expiry (must be < `--dte`) |
-| `--target-pct` | 50 (33 for iron strategies) | profit target, % of the net credit (max profit) |
-| `--stop-pct` | 100 (50 for iron strategies) | stop loss, % of the net credit taken as a loss |
+| `--exit-dte` | 21 (15 iron fly, 10 iron condor) | time exit, days before expiry (must be < `--dte`) |
+| `--target-pct` | 50 | profit target, % of the net credit (max profit) |
+| `--stop-pct` | 100 | stop loss, % of the net credit taken as a loss |
+| `--entry-time` | 15:15 | time of day to open the trade and to time-exit at (first tick at/after it; `09:20` = market open) |
 | `--lot-size` | 65 | contract multiplier |
 | `--start` / `--end` | whole archive | bounds on the **expiry** date, `YYYY-MM-DD` |
 | `--db` | `data/market_data.duckdb` | DuckDB file |
@@ -94,7 +98,8 @@ the strategy you picked.
   `results/<strategy>/` (what the Compare runs page shows for that strategy).
 - Any narrower run -> `results/<strategy>_short_runs/` (saved, not compared).
 - File names carry the settings, e.g.
-  `backtest_iron_condor_45dte_sd30_wd10_t33_s50_exit21_<start>_<end>.csv`.
+  `backtest_iron_condor_45dte_sd30_wd10_t50_s100_exit10_at1515_<start>_<end>.csv`
+  (`_at1515` = traded at 15:15; older files without it traded at the 09:20 open).
 - Every run prints/shows a **coverage checklist**: each eligible expiry ticked if
   traded, or unticked with the skip reason (e.g. data ends before the time exit).
 - Each trade row has `atm_strike` plus, for every leg the strategy uses,

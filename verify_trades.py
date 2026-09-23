@@ -16,7 +16,9 @@ rebuilds the same leg list (short_call, short_put, and for the iron strategies
 long_call, long_put) and re-derives each leg's strike independently.
 
 Per trade it checks:
-  1. entry tick   = first tick on/after (expiry - dte days)
+  1. entry tick   = on the first trading day on/after (expiry - dte days), the
+                    first tick at/after the trade time (default 15:15, read from
+                    the file name's `_at1515`; older runs = first tick of the day)
   2. strikes      = ATM is the listed strike nearest to spot at that tick; each
                     leg's strike is the listed strike nearest ATM + its offset,
                     or (iron condor) the strike whose |delta| at that tick is
@@ -25,8 +27,8 @@ Per trade it checks:
   3. entry prices + net credit match the raw prices
   4. exit tick    = the FIRST tick where the combined position value (sum of
                     sold legs minus sum of bought legs) crosses the target or
-                    stop level; if neither, the first tick on/after the
-                    time-exit date
+                    stop level; if neither, the last priced tick up to the
+                    time-exit tick (same trade time, on the time-exit day)
   5. exit prices match the raw prices at that tick
   6. P&L          = sum of each leg's (Sell: entry-exit, Buy: exit-entry) * lot
 It also reports the best/worst the combined position value got as a % of the
@@ -67,9 +69,13 @@ def _args():
     p.add_argument("--stop-pct", type=float)
     p.add_argument("--exit-dte", type=int)
     p.add_argument("--lot-size", type=int, default=65)
+    p.add_argument("--entry-time", help="HH:MM the run traded at; omit for older runs that used the "
+                                        "first tick of the day (09:20). Read from the file name if present.")
     a = p.parse_args()
 
     d = parse_run_name(pathlib.Path(a.csv).stem) or {}
+    at = a.entry_time or d.get("entry_time")
+    a.entry_time = f"{at}:00" if at else None  # "HH:MM:SS", or None = first tick of the day
     if a.strategy is None:
         a.strategy = d.get("strategy")
     if a.strategy is None:
@@ -88,6 +94,14 @@ def _args():
         sys.exit(f"Missing params for --strategy {a.strategy}: {missing}. Pass --param key=value.")
     a.params = params
     return a
+
+
+def _pick_tick(times, at_time):
+    """From one day's sorted tick times: the first at/after at_time ("HH:MM:SS"),
+    else the day's last tick; at_time None -> the day's first tick."""
+    if at_time is None:
+        return times[0]
+    return next((t for t in times if t >= at_time), times[-1])
 
 
 def _norm_time(col):
@@ -201,7 +215,7 @@ def main():
             n_fail += 1
             continue
         ec["d"] = pd.to_datetime(ec["d"]).dt.strftime("%Y-%m-%d")
-        first_t = ec["t"].min()
+        first_t = _pick_tick(sorted(ec["t"].unique()), a.entry_time)
         exp_entry_dt = f"{ec['d'].iloc[0]} {first_t}"
         if tr.entry_datetime != exp_entry_dt:
             errs.append(f"entry tick {tr.entry_datetime} != expected {exp_entry_dt}")
@@ -253,14 +267,21 @@ def main():
         stop_lvl = credit * (1 + a.stop_pct / 100.0)
         tx_date = (pd.Timestamp(exp) - pd.Timedelta(days=a.exit_dte)).date()
         later = p[p["dt"] > tr.entry_datetime]
-        tx = later[later["d"] >= str(tx_date)]
-        if tx.empty:
+        # time-exit tick: on the first trading day on/after tx_date, the first tick at/after the
+        # trade time (else that day's last tick), taken from every raw tick of the traded strikes
+        tx_days = sorted(d for d in raw["d"].unique() if d >= str(tx_date))
+        if not tx_days:
             errs.append("raw data ends before the time-exit date -- trade is incomplete")
             rows.append(dict(expiry=tr.expiry, result="FAIL", problems="; ".join(errs)))
             n_fail += 1
             continue
-        tx_dt = tx["dt"].iloc[0]  # first tick on/after the time-exit date (with a price)
+        tx_dt = f"{tx_days[0]} {_pick_tick(sorted(raw.loc[raw['d'] == tx_days[0], 't'].unique()), a.entry_time)}"
         walk = later[later["dt"] <= tx_dt]
+        if walk.empty:
+            errs.append("no priced tick between entry and the time-exit tick")
+            rows.append(dict(expiry=tr.expiry, result="FAIL", problems="; ".join(errs)))
+            n_fail += 1
+            continue
         hit_t = walk[walk["combined"] <= target_lvl]
         hit_s = walk[walk["combined"] >= stop_lvl]
         cand = []
@@ -271,7 +292,8 @@ def main():
         if cand:
             exp_exit_dt, exp_reason = min(cand)
         else:
-            exp_exit_dt, exp_reason = tx_dt, f"Time Exit ({a.exit_dte} DTE)"
+            # no trigger: closed at the last tick up to the time-exit tick that had every leg priced
+            exp_exit_dt, exp_reason = walk["dt"].iloc[-1], f"Time Exit ({a.exit_dte} DTE)"
         if tr.exit_datetime != exp_exit_dt or tr.exit_reason != exp_reason:
             errs.append(f"exit csv {tr.exit_datetime} [{tr.exit_reason}] vs raw replay {exp_exit_dt} [{exp_reason}]")
 

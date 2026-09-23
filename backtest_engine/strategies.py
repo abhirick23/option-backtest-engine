@@ -10,8 +10,8 @@ folder     -- full runs go to results/<folder>/, short runs to
               results/<folder>_short_runs/
 params     -- ordered list of the strategy's own parameters (empty for the
               straddle). Each is {key, label, default, min, max, step}.
-defaults   -- optional {"target_pct": .., "stop_pct": ..} that replace the global
-              50 / 100 defaults for this strategy.
+defaults   -- optional {"target_pct", "stop_pct", "exit_dte"} that replace the
+              global defaults (50 / 100 / 21) for this strategy.
 legs(p)    -- given a dict of the params above (by key), returns the leg
               list for backtest_engine.engine.simulate_trade/run_backtest.
 validate(p) -- optional: return an error string if p is invalid, else None.
@@ -58,7 +58,7 @@ STRATEGIES = {
         "number": 3,
         "title": "Iron Fly (Iron Butterfly)",
         "folder": "iron_fly",
-        "defaults": {"target_pct": 33.0, "stop_pct": 50.0},
+        "defaults": {"exit_dte": 15},
         "params": [
             {"key": "w", "label": "w: wing width, bought call = ATM + w, bought put = ATM - w",
              "default": 300, "min": 50, "max": 3000, "step": 50},
@@ -74,14 +74,14 @@ STRATEGIES = {
             "bought around it: a call at ATM + w and a put at ATM - w. Max profit is the *net* "
             "credit -- what the straddle brings in minus what the wings cost. The wings cap the "
             "loss on both sides, at the price of a smaller credit than a plain straddle. Target, "
-            "stop and time-exit are all a % of that net credit (defaults: target 33%, stop 50%)."
+            "stop and time-exit are all a % of that net credit (default time exit: 15 DTE)."
         ),
     },
     "iron_condor": {
         "number": 4,
         "title": "Iron Condor",
         "folder": "iron_condor",
-        "defaults": {"target_pct": 33.0, "stop_pct": 50.0},
+        "defaults": {"exit_dte": 10},
         "params": [
             {"key": "sd", "label": "sd: sold call & put at this delta (e.g. 30 = 30-delta)",
              "default": 30, "min": 5, "max": 50, "step": 5},
@@ -105,7 +105,7 @@ STRATEGIES = {
             "distance from ATM, so the trade adapts to volatility: strikes sit wider in "
             "high-vol markets and tighter in quiet ones. Max "
             "profit is the net credit -- what the sold legs bring in minus what the wings cost. "
-            "Defaults: target 33% and stop 50% of that net credit."
+            "Default time exit: 10 DTE."
         ),
     },
 }
@@ -117,10 +117,10 @@ def label(key):
 
 
 def default_rule(key):
-    """This strategy's default (target_pct, stop_pct): 50 / 100 unless the
-    registry entry overrides them."""
+    """This strategy's default (target_pct, stop_pct, exit_dte): 50 / 100 / 21
+    unless the registry entry overrides them."""
     d = STRATEGIES[key].get("defaults", {})
-    return d.get("target_pct", 50.0), d.get("stop_pct", 100.0)
+    return d.get("target_pct", 50.0), d.get("stop_pct", 100.0), d.get("exit_dte", 21)
 
 
 def default_params(key):

@@ -39,6 +39,11 @@ import pandas as pd
 from .data import get_available_expiries, load_expiry_chain, get_option_price, strike_by_delta
 from .payoff import calculate_leg_pnl
 
+# Entries and time exits are taken at this time of day (the first tick at/after
+# it on the trading day; the day's last tick if it has none). None means the
+# first tick of the day, i.e. the 09:20 open.
+DEFAULT_TRADE_TIME = "15:15:00"
+
 # The four possible leg names, in a fixed column order for the trade record.
 LEG_NAMES = ["short_call", "short_put", "long_call", "long_put"]
 
@@ -72,15 +77,20 @@ def filter_expiries(expiries, start_date, end_date):
     return sorted((e for e in in_range if e in monthly), key=lambda e: pd.to_datetime(e))
 
 
-def find_entry_datetime(unique_times, expiry, dte):
-    """First tick on/after (expiry_date - dte calendar days). None if no such
-    tick exists in this expiry's own chain (the archive doesn't reach back
-    that far for it) -- the caller treats that as 'skip'."""
-    target_date = (pd.to_datetime(expiry) - pd.Timedelta(days=dte)).date()
-    for t in unique_times:
-        if pd.to_datetime(t).date() >= target_date:
-            return t
-    return None
+def find_entry_datetime(unique_times, expiry, dte, at_time=None):
+    """The tick for the trading day on/after (expiry_date - dte calendar days):
+    the first tick at/after `at_time` ("HH:MM:SS") that day, or the day's last
+    tick if it has none (at_time None -> the day's first tick). None if the
+    expiry's own chain has no such day (the archive doesn't reach back that
+    far for it) -- the caller treats that as 'skip'."""
+    target_date = str((pd.to_datetime(expiry) - pd.Timedelta(days=dte)).date())
+    day = next((t[:10] for t in unique_times if t[:10] >= target_date), None)
+    if day is None:
+        return None
+    day_ticks = [t for t in unique_times if t[:10] == day]
+    if at_time is None:
+        return day_ticks[0]
+    return next((t for t in day_ticks if t[11:19] >= at_time), day_ticks[-1])
 
 
 def _leg_prices(df_indexed, t, resolved_legs):
@@ -107,10 +117,12 @@ def _combined(prices, resolved_legs):
     return sum(prices[l["name"]] if l["side"] == "Sell" else -prices[l["name"]] for l in resolved_legs)
 
 
-def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte=21, legs=None):
+def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte=21, legs=None,
+                   entry_time=DEFAULT_TRADE_TIME):
     """One full lifecycle (all legs) for one expiry. Returns a dict -- either
     a completed trade record, or {"skipped": True, "expiry":..., "reason":...}
-    if it couldn't be simulated. `legs` defaults to the short straddle."""
+    if it couldn't be simulated. `legs` defaults to the short straddle. Entry and
+    time exit both happen at `entry_time` on their day (see DEFAULT_TRADE_TIME)."""
     legs = legs if legs is not None else DEFAULT_LEGS
     df_indexed, unique_times, unique_strikes, spot_indexed = load_expiry_chain(db_path, expiry)
 
@@ -121,7 +133,7 @@ def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dt
         return {"skipped": True, "expiry": expiry,
                 "reason": f"exit_dte ({exit_dte}) must be smaller than dte ({dte})."}
 
-    entry_dt = find_entry_datetime(unique_times, expiry, dte)
+    entry_dt = find_entry_datetime(unique_times, expiry, dte, entry_time)
     if entry_dt is None:
         return {"skipped": True, "expiry": expiry,
                 "reason": f"No tick on/after the {dte}-DTE target date (insufficient history before entry point)."}
@@ -170,7 +182,7 @@ def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dt
     # Time exit: first tick on/after (expiry - exit_dte days). If the chain
     # ends before that date the trade never completed in the data -- skip it
     # rather than closing it early under a "time exit" label.
-    time_exit_dt = find_entry_datetime(unique_times, expiry, exit_dte)
+    time_exit_dt = find_entry_datetime(unique_times, expiry, exit_dte, entry_time)
     if time_exit_dt is None:
         return {"skipped": True, "expiry": expiry,
                 "reason": f"Data ends before the {exit_dte}-DTE time-exit date (trade would be incomplete)."}
@@ -231,7 +243,8 @@ def simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dt
     return record
 
 
-def run_backtest(db_path, dte, target_pct, stop_pct, lot_size, start_date, end_date, exit_dte=21, legs=None):
+def run_backtest(db_path, dte, target_pct, stop_pct, lot_size, start_date, end_date, exit_dte=21, legs=None,
+                 entry_time=DEFAULT_TRADE_TIME):
     """Sweeps every eligible monthly expiry. Returns (trades_df, summary, skipped_df).
 
     dte           -- calendar days before expiry to enter
@@ -241,13 +254,16 @@ def run_backtest(db_path, dte, target_pct, stop_pct, lot_size, start_date, end_d
     start_date / end_date -- datetime.date bounds on the expiry date
     exit_dte      -- time exit: calendar days before expiry (must be < dte)
     legs          -- the strategy's leg list (see module docstring); default is the straddle
+    entry_time    -- "HH:MM:SS" the trade is opened and time-exited at (default 15:15:00;
+                     None = first tick of the day, the 09:20 open)
     """
     all_expiries = get_available_expiries(db_path)
     eligible = filter_expiries(all_expiries, start_date, end_date)
 
     trades, skipped = [], []
     for expiry in eligible:
-        result = simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte, legs)
+        result = simulate_trade(db_path, expiry, dte, target_pct, stop_pct, lot_size, exit_dte, legs,
+                                entry_time)
         (skipped if result.get("skipped") else trades).append(result)
 
     trades_df = pd.DataFrame(trades)

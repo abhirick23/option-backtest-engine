@@ -60,15 +60,17 @@ def _parse_args():
     p.add_argument("--param", action="append", default=[], type=_parse_param, metavar="KEY=VALUE",
                    help="set a strategy param (repeatable), e.g. --param sd=30 --param wd=10")
     p.add_argument("--dte", type=int, default=45, help="calendar days before expiry to enter (default 45)")
-    p.add_argument("--target-pct", type=float, default=None,
-                   help="profit target: %% of the net credit collected, i.e. of max profit "
-                        "(default 50; 33 for iron_fly / iron_condor)")
-    p.add_argument("--stop-pct", type=float, default=None,
-                   help="stop loss: %% of the net credit collected, taken as a loss "
-                        "(default 100; 50 for iron_fly / iron_condor)")
+    p.add_argument("--target-pct", type=float, default=50.0,
+                   help="profit target: %% of the net credit collected, i.e. of max profit (default 50)")
+    p.add_argument("--stop-pct", type=float, default=100.0,
+                   help="stop loss: %% of the net credit collected, taken as a loss (default 100)")
     p.add_argument("--lot-size", type=int, default=65, help="contract multiplier (default 65)")
-    p.add_argument("--exit-dte", type=int, default=21,
-                   help="time exit: calendar days before expiry to close if no target/stop hit (default 21)")
+    p.add_argument("--exit-dte", type=int, default=None,
+                   help="time exit: calendar days before expiry to close if no target/stop hit "
+                        "(default 21; 15 for iron_fly, 10 for iron_condor)")
+    p.add_argument("--entry-time", default="15:15",
+                   help="HH:MM time of day to open the trade and to time-exit at: the first tick at/after it "
+                        "(default 15:15; use 09:20 for the market open)")
     p.add_argument("--start", type=datetime.date.fromisoformat, default=None,
                    help="first expiry date to include, YYYY-MM-DD (default: earliest in the data)")
     p.add_argument("--end", type=datetime.date.fromisoformat, default=None,
@@ -86,11 +88,12 @@ def main():
         _print_strategies()
         return
 
-    default_target, default_stop = default_rule(args.strategy)
-    if args.target_pct is None:
-        args.target_pct = default_target
-    if args.stop_pct is None:
-        args.stop_pct = default_stop
+    try:
+        entry_time = datetime.time.fromisoformat(args.entry_time).strftime("%H:%M:%S")
+    except ValueError:
+        sys.exit(f"--entry-time must look like HH:MM, got {args.entry_time!r}.")
+    if args.exit_dte is None:
+        args.exit_dte = default_rule(args.strategy)[2]
 
     params = default_params(args.strategy)
     valid_keys = set(params)
@@ -117,13 +120,13 @@ def main():
     param_desc = ", ".join(f"{k}={v}" for k, v in params.items())
     print(f"Rule: {label(args.strategy)}" + (f" ({param_desc})" if param_desc else "") +
           f", enter {args.dte} DTE, target {args.target_pct:g}% / stop {args.stop_pct:g}% of net credit, "
-          f"time exit {args.exit_dte} DTE, lot size {args.lot_size}")
+          f"time exit {args.exit_dte} DTE, trade time {entry_time[:5]}, lot size {args.lot_size}")
     print(f"Sweep: monthly expiries from {start} to {end}")
     print("Running (each expiry takes a couple of seconds to load)...\n")
 
     legs = build_legs(args.strategy, params)
     trades_df, summary, skipped_df = run_backtest(
-        db_path, args.dte, args.target_pct, args.stop_pct, args.lot_size, start, end, args.exit_dte, legs
+        db_path, args.dte, args.target_pct, args.stop_pct, args.lot_size, start, end, args.exit_dte, legs, entry_time
     )
 
     if summary["total_trades"] == 0:
@@ -141,7 +144,8 @@ def main():
         print(f"Worst trade     : {summary['worst_trade']:,.2f}")
 
         trades_path, full = save_run(args.strategy, trades_df, pathlib.Path(args.out_dir), expiries, args.dte,
-                                     params, args.target_pct, args.stop_pct, args.exit_dte, start, end)
+                                     params, args.target_pct, args.stop_pct, args.exit_dte, start, end,
+                                     entry_time)
         kind = "FULL run (counts in Compare runs)" if full else "short run (not in Compare runs)"
         print(f"\nTrades written to {trades_path}  -- {kind}")
 

@@ -6,6 +6,7 @@ Streamlit UI for the backtest engine.
     streamlit run app.py
 """
 
+import datetime
 import pathlib
 
 import pandas as pd
@@ -52,9 +53,11 @@ data_max = pd.to_datetime(max(expiries)).date()
 
 with st.sidebar:
     st.header(label(strategy))
+    default_target, default_stop, default_exit = default_rule(strategy)
     dte = st.number_input("Entry: days before expiry", 2, 120, 45)
-    exit_dte = st.number_input("Time exit: days before expiry", 0, 119, 21)
-    default_target, default_stop = default_rule(strategy)
+    exit_dte = st.number_input("Time exit: days before expiry", 0, 119, default_exit)
+    trade_time = st.time_input("Trade time (entry and time exit)", datetime.time(15, 15), step=300,
+                               help="The first 5-minute tick at/after this time is used. 09:20 = market open.")
     target_pct = st.number_input("Profit target (% of max profit / credit)", 1.0, 100.0, default_target, step=1.0)
     stop_pct = st.number_input("Stop loss (% of credit, as a loss)", 1.0, 1000.0, default_stop, step=5.0)
     params = {}
@@ -82,13 +85,15 @@ if go:
     legs = build_legs(strategy, params)
     with st.spinner("Running (each expiry takes a couple of seconds on the first run)..."):
         st.session_state["result"] = _run(DB_PATH, int(dte), float(target_pct), float(stop_pct),
-                                          int(lot_size), start, end, int(exit_dte), legs)
+                                          int(lot_size), start, end, int(exit_dte), legs,
+                                          trade_time.strftime("%H:%M:%S"))
     st.session_state["result_strategy"] = strategy
     _t, _s, _k = st.session_state["result"]
     st.session_state["saved_path"] = None
     if _s["total_trades"]:
         saved, full = save_run(strategy, _t.drop(columns=["skipped"]), ROOT / "results", expiries, int(dte),
-                               params, target_pct, stop_pct, int(exit_dte), start, end)
+                               params, target_pct, stop_pct, int(exit_dte), start, end,
+                               trade_time.strftime("%H:%M:%S"))
         st.session_state["saved_path"] = (str(saved), full)
 
 if st.session_state.get("result_strategy") != strategy:
