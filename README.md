@@ -19,9 +19,14 @@ wings at ~10-delta, chosen at entry among strikes that have a traded price
 strategies are added in `backtest_engine/strategies.py` -- one entry with a leg
 list and its own params, nothing else needs to change.
 
-Default exit rule: target 50% / stop 100% of the net credit for every strategy.
-Default time exit: 21 DTE, except the iron fly (**15 DTE**) and iron condor
-(**10 DTE**). Trades are opened and time-exited at **15:15** (the first 5-minute
+Default exit rule (target / stop, % of the net credit; time exit in DTE):
+
+| strategy | target | stop | time exit |
+|---|---|---|---|
+| straddle, strangle | 50% | 100% | 21 |
+| iron fly | 33% | 50% | 15 |
+| iron condor | 50% | 100% | 10 |
+ Trades are opened and time-exited at **15:15** (the first 5-minute
 tick at/after it), not at the 09:20 open; use `--entry-time 09:20` for the old
 behaviour.
 
@@ -84,8 +89,8 @@ the strategy you picked.
 | `--param key=value` | (per strategy) | set one of the strategy's own params; repeatable |
 | `--dte` | 45 | days before expiry to enter |
 | `--exit-dte` | 21 (15 iron fly, 10 iron condor) | time exit, days before expiry (must be < `--dte`) |
-| `--target-pct` | 50 | profit target, % of the net credit (max profit) |
-| `--stop-pct` | 100 | stop loss, % of the net credit taken as a loss |
+| `--target-pct` | 50 (33 iron fly) | profit target, % of the net credit (max profit) |
+| `--stop-pct` | 100 (50 iron fly) | stop loss, % of the net credit taken as a loss |
 | `--entry-time` | 15:15 | time of day to open the trade and to time-exit at (first tick at/after it; `09:20` = market open) |
 | `--lot-size` | 65 | contract multiplier |
 | `--start` / `--end` | whole archive | bounds on the **expiry** date, `YYYY-MM-DD` |

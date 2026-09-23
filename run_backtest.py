@@ -60,10 +60,12 @@ def _parse_args():
     p.add_argument("--param", action="append", default=[], type=_parse_param, metavar="KEY=VALUE",
                    help="set a strategy param (repeatable), e.g. --param sd=30 --param wd=10")
     p.add_argument("--dte", type=int, default=45, help="calendar days before expiry to enter (default 45)")
-    p.add_argument("--target-pct", type=float, default=50.0,
-                   help="profit target: %% of the net credit collected, i.e. of max profit (default 50)")
-    p.add_argument("--stop-pct", type=float, default=100.0,
-                   help="stop loss: %% of the net credit collected, taken as a loss (default 100)")
+    p.add_argument("--target-pct", type=float, default=None,
+                   help="profit target: %% of the net credit collected, i.e. of max profit "
+                        "(default 50; 33 for iron_fly)")
+    p.add_argument("--stop-pct", type=float, default=None,
+                   help="stop loss: %% of the net credit collected, taken as a loss "
+                        "(default 100; 50 for iron_fly)")
     p.add_argument("--lot-size", type=int, default=65, help="contract multiplier (default 65)")
     p.add_argument("--exit-dte", type=int, default=None,
                    help="time exit: calendar days before expiry to close if no target/stop hit "
@@ -92,8 +94,13 @@ def main():
         entry_time = datetime.time.fromisoformat(args.entry_time).strftime("%H:%M:%S")
     except ValueError:
         sys.exit(f"--entry-time must look like HH:MM, got {args.entry_time!r}.")
+    default_target, default_stop, default_exit = default_rule(args.strategy)
+    if args.target_pct is None:
+        args.target_pct = default_target
+    if args.stop_pct is None:
+        args.stop_pct = default_stop
     if args.exit_dte is None:
-        args.exit_dte = default_rule(args.strategy)[2]
+        args.exit_dte = default_exit
 
     params = default_params(args.strategy)
     valid_keys = set(params)

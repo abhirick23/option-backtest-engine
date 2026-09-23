@@ -58,7 +58,7 @@ STRATEGIES = {
         "number": 3,
         "title": "Iron Fly (Iron Butterfly)",
         "folder": "iron_fly",
-        "defaults": {"exit_dte": 15},
+        "defaults": {"target_pct": 33.0, "stop_pct": 50.0, "exit_dte": 15},
         "params": [
             {"key": "w", "label": "w: wing width, bought call = ATM + w, bought put = ATM - w",
              "default": 300, "min": 50, "max": 3000, "step": 50},
@@ -74,7 +74,7 @@ STRATEGIES = {
             "bought around it: a call at ATM + w and a put at ATM - w. Max profit is the *net* "
             "credit -- what the straddle brings in minus what the wings cost. The wings cap the "
             "loss on both sides, at the price of a smaller credit than a plain straddle. Target, "
-            "stop and time-exit are all a % of that net credit (default time exit: 15 DTE)."
+            "stop and time-exit are all a % of that net credit (defaults: target 33%, stop 50%, time exit 15 DTE)."
         ),
     },
     "iron_condor": {
